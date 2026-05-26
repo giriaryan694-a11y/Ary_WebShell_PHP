@@ -12,7 +12,6 @@ A lightweight, single-file browser-based interactive terminal webshell written i
 - [Description](#description)
 - [Features](#features)
 - [Screenshots](#screenshots)
-- [Configuration](#configuration)
 - [Usage](#usage)
 - [Known Issues](#known-issues)
 - [Disclaimer](#disclaimer)
@@ -28,7 +27,7 @@ The terminal frontend is powered by **xterm.js** with the **FitAddon**, giving y
 ### How it works
 1. Upload `ary_webshell.php` to the target web server.
 2. Browse to `http://target/ary_webshell.php`.
-3. Log in with the configured credentials.
+3. Click **New Session** to spawn a fresh bash shell.
 4. You get a live bash prompt in the browser. Type commands, run tools, pivot internally.
 
 ---
@@ -37,13 +36,14 @@ The terminal frontend is powered by **xterm.js** with the **FitAddon**, giving y
 
 | Feature | Detail |
 |---------|--------|
-| **Single-file deployment** | Everything (auth, terminal engine, shell bridge) is self-contained in `ary_webshell.php` |
+| **Single-file deployment** | Everything (session manager, terminal engine, shell bridge) is self-contained in `ary_webshell.php` |
 | **Real interactive shell** | Uses `proc_open('/bin/bash -i')` with SSE streaming |
+| **Multi-session support** | Spawn multiple independent shells like Metasploit — each with its own PID, interactable or killable |
+| **No authentication** | No hardcoded credentials; anyone with access to the file can spawn sessions |
+| **No IP restrictions** | No allowlist blocking; works from any IP |
 | **PTY support (PHP 8.1+)** | Automatically allocates a pseudo-terminal when available so `vim`, `nano`, `top`, etc. render correctly |
 | **Pipe fallback** | Gracefully degrades to pipe mode on older PHP versions |
 | **Smart Ctrl+C** | Copies text when a selection exists; sends `SIGINT` to the shell otherwise |
-| **IP allowlist** | Restrict access by IP or allow all (`*`) |
-| **Session isolation** | Each browser session gets its own shell process |
 | **Mobile-friendly toolbar** | On-screen buttons for ESC, TAB, arrows, ^C, and a toggleable CTRL mode |
 | **No command logging** | No persistent command logs are written to disk |
 | **No external dependencies** | Only requires PHP and network access to CDN for xterm.js CSS/JS |
@@ -52,46 +52,20 @@ The terminal frontend is powered by **xterm.js** with the **FitAddon**, giving y
 
 ## Screenshots
 
-### Configuration Block
-The configuration section starts at **line 27** in `ary_webshell.php`. You can change default credentials, allowed IPs, and token before deployment.
+### Session Manager
+Spawn, interact with, and kill multiple independent shell sessions.
 
-![Configuration View](https://raw.githubusercontent.com/giriaryan694-a11y/Ary_WebShell_PHP/refs/heads/main/img/1.png)
+![Session Manager](https://raw.githubusercontent.com/giriaryan694-a11y/Ary_WebShell_PHP/refs/heads/main/img/1.png)
 
 ### Login Page
-Clean, dark-themed login interface.
+Clean, dark-themed interface. No auth needed — just click **New Session**.
 
 ![Login Page](https://raw.githubusercontent.com/giriaryan694-a11y/Ary_WebShell_PHP/refs/heads/main/img/2.png)
 
 ### Terminal Demo
-Live command execution inside the browser.
+Live command execution inside the browser with xterm.js.
 
 ![Commands Demo](https://raw.githubusercontent.com/giriaryan694-a11y/Ary_WebShell_PHP/refs/heads/main/img/3.png)
-
----
-
-## Configuration
-
-Open `ary_webshell.php` and edit the block starting at **line 27**:
-
-```php
-/* ========================================== */
-/* --- USER SECURITY & CONFIGURATION -------- */
-/* ========================================== */
-define('CONFIG_USERNAME', 'admin');
-define('CONFIG_PASSWORD', 'password123');
-define('STATIC_TOKEN', 'securetoken123');
-
-// Set to "*" to allow anyone, or specify IPs like: ["127.0.0.1", "192.168.1.15"]
-$ALLOWED_IPS = ["*"];
-/* ========================================== */
-```
-
-| Setting | Description |
-|---------|-------------|
-| `CONFIG_USERNAME` | Login username |
-| `CONFIG_PASSWORD` | Login password |
-| `STATIC_TOKEN` | Session token (auto-set after login, rarely needs changing) |
-| `$ALLOWED_IPS` | Array of allowed IPs. Use `["*"]` for any IP, or restrict to specific addresses |
 
 ---
 
@@ -101,8 +75,10 @@ $ALLOWED_IPS = ["*"];
 1. Identify a file upload vulnerability on the target.
 2. Upload `ary_webshell.php` to a web-accessible path.
 3. Visit the file in your browser.
-4. Enter the configured username and password.
+4. Click **New Session** to spawn a shell.
 5. Use the terminal to execute commands, enumerate the system, or pivot to other hosts.
+6. Spawn additional sessions as needed (e.g., one for a listener, one for enumeration).
+7. Kill sessions from the manager when done.
 
 ### Toolbar Buttons
 | Button | Action |
@@ -110,7 +86,7 @@ $ALLOWED_IPS = ["*"];
 | **CTRL** | Toggle on-screen Ctrl mode. Next letter typed becomes a control character (e.g., `c` → `^C`) |
 | **ESC** | Send Escape key (`\x1b`) |
 | **TAB** | Send Tab key (`\x09`) |
-| **< > ^ v** | Arrow keys |
+| **<< > ^ v** | Arrow keys |
 | **^C** | Send `Ctrl+C` / `SIGINT` directly |
 
 ### Keyboard Shortcuts
